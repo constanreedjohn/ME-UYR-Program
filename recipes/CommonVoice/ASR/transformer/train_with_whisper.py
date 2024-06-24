@@ -79,67 +79,74 @@ class AMPConfig:
 
 # Define training procedure
 class ASR(sb.Brain):
-    def compute_forward(self, batch, stage):
-        print(f"BATCH SIZE: {batch.batchsize}")
-        print(f"{vars(batch)}")
-        raise ValueError("CHECK")
+    def compute_forward(self, source_batch, target_batch, stage):
+        # TODO: Implement target process here
+        print(f"[COMPUTE FORWARD] BATCH SIZE: {source_batch.batchsize}")
+        print(f"[COMPUTE FORWARD] {vars(source_batch)}")
+    
         """Forward computations from the waveform batches to the output probabilities."""
-        batch = batch.to(self.device)
-        wavs, wav_lens = batch.sig
-        bos_tokens, bos_tokens_lens = batch.tokens_bos
+        # Process source batch as supervised learning
+        source_batch = source_batch.to(self.device)
+        source_wavs, source_wav_lens = source_batch.sig
+        source_bos_tokens, source_bos_tokens_lens = source_batch.tokens_bos
 
         # Add waveform augmentation if specified.
         if stage == sb.Stage.TRAIN and hasattr(self.hparams, "wav_augment"):
-            wavs, wav_lens = self.hparams.wav_augment(wavs, wav_lens)
-            bos_tokens = self.hparams.wav_augment.replicate_labels(bos_tokens)
-            bos_tokens_lens = self.hparams.wav_augment.replicate_labels(
-                bos_tokens_lens
+            source_wavs, source_wav_lens = self.hparams.wav_augment(source_wavs, source_wav_lens)
+            source_bos_tokens = self.hparams.wav_augment.replicate_labels(source_bos_tokens)
+            source_bos_tokens_lens = self.hparams.wav_augment.replicate_labels(
+                source_bos_tokens_lens
             )
 
         # We compute the padding mask and replace the values with the pad_token_id
         # that the Whisper decoder expect to see.
-        abs_tokens_lens = (bos_tokens_lens * bos_tokens.shape[1]).long()
+        source_abs_tokens_lens = (source_bos_tokens_lens * source_bos_tokens.shape[1]).long()
         pad_mask = (
-            torch.arange(abs_tokens_lens.max(), device=self.device)[None, :]
-            < abs_tokens_lens[:, None]
+            torch.arange(source_abs_tokens_lens.max(), device=self.device)[None, :]
+            < source_abs_tokens_lens[:, None]
         )
-        bos_tokens[~pad_mask] = self.tokenizer.pad_token_id
+        source_bos_tokens[~pad_mask] = self.tokenizer.pad_token_id
 
         # Forward encoder + decoder
-        enc_out, logits, _ = self.modules.whisper(wavs, bos_tokens)
-        log_probs = self.hparams.log_softmax(logits)
+        source_enc_out, source_logits, _ = self.modules.whisper(source_wavs, source_bos_tokens)
+        print(f"[COMPUTE_FORWARD] ENCODER OUTPUT: {source_enc_out}")
+        print(f"[COMPUTE_FORWARD] LOGITS E2E WHISPER: {source_logits}")
+        
+        log_probs = self.hparams.log_softmax(source_logits)
 
         hyps = None
-        if stage == sb.Stage.VALID:
+        if stage == sb.Stage.TRAIN:
             hyps, _, _, _ = self.hparams.valid_search(
-                enc_out.detach(), wav_lens
+                source_enc_out.detach(), source_wav_lens
             )
         elif stage == sb.Stage.TEST:
-            hyps, _, _, _ = self.hparams.test_search(enc_out.detach(), wav_lens)
+            hyps, _, _, _ = self.hparams.test_search(source_enc_out.detach(), source_wav_lens)
 
-        return log_probs, hyps, wav_lens
+        return log_probs, hyps, source_wav_lens
 
-    def compute_objectives(self, predictions, batch, stage):
+    def compute_objectives(self, source_predictions, target_prediction, source_batch, target_batch, stage):
         """Computes the loss NLL given predictions and targets."""
+        # TODO: Implement target process here
 
-        (log_probs, hyps, wav_lens) = predictions
-        batch = batch.to(self.device)
-        ids = batch.id
-        tokens_eos, tokens_eos_lens = batch.tokens_eos
+        (source_log_probs, hyps, source_wav_lens) = source_predictions
+        source_batch = source_batch.to(self.device)
+        ids = source_batch.id
+        source_tokens_eos, source_tokens_eos_lens = source_batch.tokens_eos
 
         # Augment Labels
         if stage == sb.Stage.TRAIN and hasattr(self.hparams, "wav_augment"):
-            tokens_eos = self.hparams.wav_augment.replicate_labels(tokens_eos)
-            tokens_eos_lens = self.hparams.wav_augment.replicate_labels(
-                tokens_eos_lens
+            source_tokens_eos = self.hparams.wav_augment.replicate_labels(source_tokens_eos)
+            source_tokens_eos_lens = self.hparams.wav_augment.replicate_labels(
+                source_tokens_eos_lens
             )
 
         loss = self.hparams.nll_loss(
-            log_probs, tokens_eos, length=tokens_eos_lens
+            source_log_probs, source_tokens_eos, length=source_tokens_eos_lens
         )
-
-        if stage != sb.Stage.TRAIN:
-            tokens, tokens_lens = batch.tokens
+        print(f"[COMPUTE_OBJECTIVES] SOURCE PROBS: {source_log_probs}")
+        print(f"[COMPUTE_OBJECTIVES] HYPS: {hyps}")
+        if stage == sb.Stage.TRAIN:
+            tokens, tokens_lens = source_batch.tokens
 
             # Decode token terms to words
             predicted_words = [
@@ -169,6 +176,9 @@ class ASR(sb.Brain):
 
             self.wer_metric.append(ids, predicted_words, target_words)
             self.cer_metric.append(ids, predicted_words, target_words)
+            print(f"[COMPUTE OBJECTIVES] LABEL: {target_words}")
+            print(f"[COMPUTE OBJECTIVES] PREDICTED: {predicted_words}")
+            raise ValueError("CHECK")
 
         return loss
     
@@ -343,7 +353,12 @@ class ASR(sb.Brain):
 
         # Iterate epochs
         for epoch in epoch_counter:
-            self._fit_train(train_set=train_set, epoch=epoch, enable=enable)
+            self._fit_train(
+                source_train_set=source_train_set, 
+                target_train_set=target_train_set, 
+                epoch=epoch, 
+                enable=enable
+            )
             self._fit_valid(valid_set=valid_set, epoch=epoch, enable=enable)
 
             # Debug mode only runs a few epochs
@@ -353,6 +368,99 @@ class ASR(sb.Brain):
                 or self._optimizer_step_limit_exceeded
             ):
                 break
+    
+    def _fit_valid(self, valid_set, epoch, enable):
+        # Validation stage
+        if valid_set is not None:
+            self.on_stage_start(Stage.VALID, epoch)
+            self.modules.eval()
+            avg_valid_loss = 0.0
+            with torch.no_grad():
+                for batch in tqdm(
+                    valid_set,
+                    dynamic_ncols=True,
+                    disable=not enable,
+                    colour=self.tqdm_barcolor["valid"],
+                ):
+                    self.step += 1
+                    loss = self.evaluate_batch(batch, stage=Stage.VALID)
+                    avg_valid_loss = self.update_average(loss, avg_valid_loss)
+
+                    # Debug mode only runs a few batches
+                    if self.debug and self.step == self.debug_batches:
+                        break
+
+                self.step = 0
+                self.on_stage_end(Stage.VALID, avg_valid_loss, epoch)
+    
+    @torch.no_grad()
+    def evaluate_batch(self, source_batch, target_batch, stage):
+        """Evaluate one batch, override for different procedure than train.
+
+        The default implementation depends on two methods being defined
+        with a particular behavior:
+
+        * ``compute_forward()``
+        * ``compute_objectives()``
+
+        Arguments
+        ---------
+        batch : list of torch.Tensors
+            Batch of data to use for evaluation. Default implementation assumes
+            this batch has two elements: inputs and targets.
+        stage : Stage
+            The stage of the experiment: Stage.VALID, Stage.TEST
+
+        Returns
+        -------
+        detached loss
+        """
+        amp = AMPConfig.from_name(self.eval_precision)
+        if stage == Stage.TRAIN:
+            if self.use_amp:
+                with torch.autocast(
+                    dtype=amp.dtype, device_type=torch.device(self.device).type
+                ):
+                    source_outputs = self.compute_forward(source_batch=source_batch, target_batch=target_batch, stage=sb.Stage.TRAIN)
+                    source_loss = self.compute_objectives(
+                        source_predictions=source_outputs, 
+                        source_batch=source_batch, 
+                        target_prediction=source_outputs,
+                        target_batch=target_batch,
+                        stage=sb.Stage.TRAIN
+                    )
+            else:
+                source_outputs = self.compute_forward(source_batch=source_batch, target_batch=target_batch, stage=sb.Stage.TRAIN)
+                source_loss = self.compute_objectives(
+                    source_predictions=source_outputs, 
+                    source_batch=source_batch, 
+                    target_prediction=source_outputs,
+                    target_batch=target_batch,
+                    stage=sb.Stage.TRAIN
+                )
+        elif stage != Stage.TRAIN:
+            if self.use_amp:
+                with torch.autocast(
+                    dtype=amp.dtype, device_type=torch.device(self.device).type
+                ):
+                    source_outputs = self.compute_forward(source_batch=source_batch, target_batch=None, stage=sb.Stage.VALID)
+                    source_loss = self.compute_objectives(
+                        source_predictions=source_outputs, 
+                        source_batch=source_batch, 
+                        target_prediction=source_outputs,
+                        target_batch=None,
+                        stage=sb.Stage.VALID
+                    )
+            else:
+                source_outputs = self.compute_forward(source_batch=source_batch, target_batch=None, stage=sb.Stage.VALID)
+                source_loss = self.compute_objectives(
+                    source_predictions=source_outputs, 
+                    source_batch=source_batch, 
+                    target_prediction=source_outputs,
+                    target_batch=None,
+                    stage=sb.Stage.VALID
+                )
+        return source_loss.detach().cpu()
     
     def _fit_train(self, source_train_set, target_train_set, epoch, enable):
         # Training stage
@@ -375,7 +483,8 @@ class ASR(sb.Brain):
         # TODO: Implement source and target data combination percentage base here
         
         with tqdm(
-            source_train_set,
+            zip(source_train_set, target_train_set),
+            total=len(source_train_data) + len(target_train_data),
             initial=self.step,
             dynamic_ncols=True,
             disable=not enable,
@@ -383,13 +492,13 @@ class ASR(sb.Brain):
         ) as t:
             if self.profiler is not None:
                 self.profiler.start()
-            for batch in t:
+            for source_batch, target_batch in t:
                 if self._optimizer_step_limit_exceeded:
                     logger.info("Train iteration limit exceeded")
                     break
                 self.step += 1
                 steps_since_ckpt += 1
-                loss = self.fit_batch(batch)
+                loss = self.fit_batch(source_batch=source_batch, target_batch=target_batch)
                 self.avg_train_loss = self.update_average(
                     loss, self.avg_train_loss
                 )
@@ -418,11 +527,11 @@ class ASR(sb.Brain):
 
         # Run train "on_stage_end" on all processes
         self.zero_grad(set_to_none=True)  # flush gradients
-        self.on_stage_end(Stage.TRAIN, self.avg_train_loss, epoch)
+        # self.on_stage_end(Stage.TRAIN, self.avg_train_loss, epoch)
         self.avg_train_loss = 0.0
         self.step = 0
 
-    def fit_batch(self, batch):
+    def fit_batch(self, source_batch, target_batch):
         """Fit one batch, override to do multiple updates.
 
         The default implementation depends on a few methods being defined
@@ -452,25 +561,35 @@ class ASR(sb.Brain):
                 with torch.autocast(
                     dtype=amp.dtype, device_type=torch.device(self.device).type
                 ):
-                    outputs = self.compute_forward(batch, sb.Stage.TRAIN)
-                    loss = self.compute_objectives(
-                        outputs, batch, sb.Stage.TRAIN
+                    source_outputs = self.compute_forward(source_batch=source_batch, target_batch=target_batch, stage=sb.Stage.TRAIN)
+                    source_loss = self.compute_objectives(
+                        source_predictions=source_outputs, 
+                        source_batch=source_batch, 
+                        target_prediction=source_outputs,
+                        target_batch=target_batch,
+                        stage=sb.Stage.TRAIN
                     )
             else:
-                outputs = self.compute_forward(batch, sb.Stage.TRAIN)
-                loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+                source_outputs = self.compute_forward(source_batch=source_batch, target_batch=target_batch, stage=sb.Stage.TRAIN)
+                source_loss = self.compute_objectives(
+                    source_predictions=source_outputs, 
+                    source_batch=source_batch, 
+                    target_prediction=source_outputs,
+                    target_batch=target_batch,
+                    stage=sb.Stage.TRAIN
+                )
 
-            scaled_loss = self.scaler.scale(
-                loss / self.grad_accumulation_factor
+            scaled_source_loss = self.scaler.scale(
+                source_loss / self.grad_accumulation_factor
             )
-            self.check_loss_isfinite(scaled_loss)
-            scaled_loss.backward()
+            self.check_loss_isfinite(scaled_source_loss)
+            scaled_source_loss.backward()
 
         if should_step:
             self.optimizers_step()
 
-        self.on_fit_batch_end(batch, outputs, loss, should_step)
-        return loss.detach().cpu()
+        self.on_fit_batch_end(source_batch, source_outputs, source_loss, should_step)
+        return source_loss.detach().cpu()
     
     def on_stage_start(self, stage, epoch):
         """Gets called at the beginning of each epoch"""
