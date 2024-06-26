@@ -17,6 +17,8 @@ import sys
 import torch
 import torchaudio
 import time
+import faiss
+import numpy as np
 from tqdm import tqdm
 from enum import Enum, auto
 from dataclasses import dataclass
@@ -79,11 +81,7 @@ class AMPConfig:
 
 # Define training procedure
 class ASR(sb.Brain):
-    def compute_forward(self, source_batch, target_batch, stage):
-        # TODO: Implement target process here
-        print(f"[COMPUTE FORWARD] BATCH SIZE: {source_batch.batchsize}")
-        print(f"[COMPUTE FORWARD] {vars(source_batch)}")
-    
+    def compute_forward(self, source_batch, target_batch, faiss_index, faiss_k, stage):
         """Forward computations from the waveform batches to the output probabilities."""
         # Process source batch as supervised learning
         source_batch = source_batch.to(self.device)
@@ -91,7 +89,7 @@ class ASR(sb.Brain):
         source_bos_tokens, source_bos_tokens_lens = source_batch.tokens_bos
 
         # Add waveform augmentation if specified.
-        if stage == sb.Stage.TRAIN and hasattr(self.hparams, "wav_augment"):
+        if stage == Stage.TRAIN and hasattr(self.hparams, "wav_augment"):
             source_wavs, source_wav_lens = self.hparams.wav_augment(source_wavs, source_wav_lens)
             source_bos_tokens = self.hparams.wav_augment.replicate_labels(source_bos_tokens)
             source_bos_tokens_lens = self.hparams.wav_augment.replicate_labels(
@@ -108,44 +106,76 @@ class ASR(sb.Brain):
         source_bos_tokens[~pad_mask] = self.tokenizer.pad_token_id
 
         # Forward encoder + decoder
+        target_enc_out = None
         source_enc_out, source_logits, _ = self.modules.whisper(source_wavs, source_bos_tokens)
-        print(f"[COMPUTE_FORWARD] ENCODER OUTPUT: {source_enc_out}")
-        print(f"[COMPUTE_FORWARD] LOGITS E2E WHISPER: {source_logits}")
+        source_log_probs = self.hparams.log_softmax(source_logits)
+        # print(f"[COMPUTE_FORWARD] SOURCE ENCODER OUTPUT: {source_enc_out} - {type(source_enc_out)} - {source_enc_out.shape}")
         
-        log_probs = self.hparams.log_softmax(source_logits)
-
+        if stage == Stage.TRAIN:
+            target_wavs, target_wav_lens = target_batch.sig
+            
+            source_embedding = source_enc_out.detach().cpu().numpy()    # (batchsize, 1500, 384)
+            source_embedding = source_embedding.reshape((source_embedding.shape[0], -1)) # (batchsize, 576000)
+            
+            # print(f"[COMPUTE_FORWARD] SOURCE EMBEDDING: {source_embedding} - {source_embedding.shape}")
+            faiss_distance, faiss_sample = faiss_index.search(source_embedding, faiss_k)
+            
+            # print(f"[COMPUTER_FORWARD] FAISS SAMPLE ID: {faiss_sample} - {faiss_sample.shape}")
+            simliarity = [faiss_index.reconstruct_batch(i.shape[0]) for i in faiss_sample]
+            simliarity = np.asarray(simliarity)
+            simliarity = simliarity.reshape((simliarity.shape[0], 1500, 384))
+            
+            # print(f"[COMPUTER_FORWARD] FAISS RECONSTRUCT: {simliarity} - {simliarity.shape}")
+            target_filtered = torch.tensor(simliarity, dtype=torch.float32)
+            target_filtered = target_filtered.to(self.device)
+            target_log_probs = source_enc_out + target_filtered
+            
+            # print(f"[COMPUTER_FORWARD] COMBINATION BETWEEN SOURCE AND TARGET WITH BATCH OF {source_enc_out.shape[0]}: {target_log_probs.shape}")
+            target_log_probs = torch.nn.functional.relu(target_log_probs)
+            
+            return [source_log_probs, None, source_wav_lens], [target_log_probs, target_wav_lens]
+        
         hyps = None
-        if stage == sb.Stage.TRAIN:
+        if stage == Stage.VALID:
             hyps, _, _, _ = self.hparams.valid_search(
                 source_enc_out.detach(), source_wav_lens
             )
-        elif stage == sb.Stage.TEST:
+        elif stage == Stage.TEST:
             hyps, _, _, _ = self.hparams.test_search(source_enc_out.detach(), source_wav_lens)
 
-        return log_probs, hyps, source_wav_lens
+        return [source_log_probs, hyps, source_wav_lens], []
 
     def compute_objectives(self, source_predictions, target_prediction, source_batch, target_batch, stage):
+        def _get_entropy_batch(p_softmax):
+            p_softmax = p_softmax.view(-1, p_softmax.shape[-1])
+            entropy = - torch.mul(p_softmax, torch.log(p_softmax + 1e-7))
+            entropy =  torch.sum(entropy, dim=1)
+            return entropy
         """Computes the loss NLL given predictions and targets."""
-        # TODO: Implement target process here
-
+        
         (source_log_probs, hyps, source_wav_lens) = source_predictions
         source_batch = source_batch.to(self.device)
         ids = source_batch.id
         source_tokens_eos, source_tokens_eos_lens = source_batch.tokens_eos
-
+        
         # Augment Labels
-        if stage == sb.Stage.TRAIN and hasattr(self.hparams, "wav_augment"):
+        if stage == Stage.TRAIN and hasattr(self.hparams, "wav_augment"):
             source_tokens_eos = self.hparams.wav_augment.replicate_labels(source_tokens_eos)
             source_tokens_eos_lens = self.hparams.wav_augment.replicate_labels(
                 source_tokens_eos_lens
             )
-
-        loss = self.hparams.nll_loss(
+        
+        source_loss = self.hparams.nll_loss(
             source_log_probs, source_tokens_eos, length=source_tokens_eos_lens
         )
-        print(f"[COMPUTE_OBJECTIVES] SOURCE PROBS: {source_log_probs}")
-        print(f"[COMPUTE_OBJECTIVES] HYPS: {hyps}")
-        if stage == sb.Stage.TRAIN:
+        target_loss = 0.0
+        if stage == Stage.TRAIN:
+            (combine_log_probs, combine_wav_lens) = target_prediction
+            target_batch = target_batch.to(self.device)
+            target_loss = _get_entropy_batch(combine_log_probs)
+            # print(f"[COMPUTE_OBJECTIVE] TARGET ENTROPY: {target_entropy} - {type(target_entropy)} - {target_entropy.shape}")
+        
+        if stage != Stage.TRAIN:
             tokens, tokens_lens = source_batch.tokens
 
             # Decode token terms to words
@@ -178,9 +208,8 @@ class ASR(sb.Brain):
             self.cer_metric.append(ids, predicted_words, target_words)
             print(f"[COMPUTE OBJECTIVES] LABEL: {target_words}")
             print(f"[COMPUTE OBJECTIVES] PREDICTED: {predicted_words}")
-            raise ValueError("CHECK")
 
-        return loss
+        return source_loss, target_loss
     
     def make_dataloader(
         self, dataset, stage, ckpt_prefix="dataloader-", **loader_kwargs
@@ -232,7 +261,7 @@ class ASR(sb.Brain):
         DataLoader for the input dataset
         """
         # TRAIN stage is handled specially.
-        if stage == sb.Stage.TRAIN:
+        if stage == Stage.TRAIN:
             loader_kwargs = self._train_loader_specifics(dataset, loader_kwargs)
         # This commented-out code block is useful when one can ensure
         # metric reporting is DDP-valid for VALID & EVAL datasets.
@@ -265,6 +294,8 @@ class ASR(sb.Brain):
         progressbar=None,
         train_loader_kwargs={},
         valid_loader_kwargs={},
+        faiss_num_query=1000,
+        faiss_db_size=1000
     ):
         """Iterate epochs and datasets to improve objective.
 
@@ -321,7 +352,7 @@ class ASR(sb.Brain):
             or isinstance(source_train_set, LoopedLoader)
         ):
             source_train_set = self.make_dataloader(
-                source_train_set, stage=sb.Stage.TRAIN, **train_loader_kwargs
+                source_train_set, stage=Stage.TRAIN, **train_loader_kwargs
             )
             
         if not (
@@ -329,7 +360,7 @@ class ASR(sb.Brain):
             or isinstance(target_train_set, LoopedLoader)
         ):
             target_train_set = self.make_dataloader(
-                target_train_set, stage=sb.Stage.TRAIN, **train_loader_kwargs
+                target_train_set, stage=Stage.TRAIN, **train_loader_kwargs
             )
             
         if valid_set is not None and not (
@@ -338,7 +369,7 @@ class ASR(sb.Brain):
         ):
             valid_set = self.make_dataloader(
                 valid_set,
-                stage=sb.Stage.VALID,
+                stage=Stage.VALID,
                 ckpt_prefix=None,
                 **valid_loader_kwargs,
             )
@@ -350,12 +381,11 @@ class ASR(sb.Brain):
 
         # Only show progressbar if requested and main_process
         enable = progressbar and sb.utils.distributed.if_main_process()
-
         # Iterate epochs
         for epoch in epoch_counter:
             self._fit_train(
                 source_train_set=source_train_set, 
-                target_train_set=target_train_set, 
+                target_train_set=target_train_set,
                 epoch=epoch, 
                 enable=enable
             )
@@ -368,99 +398,44 @@ class ASR(sb.Brain):
                 or self._optimizer_step_limit_exceeded
             ):
                 break
-    
-    def _fit_valid(self, valid_set, epoch, enable):
-        # Validation stage
-        if valid_set is not None:
-            self.on_stage_start(Stage.VALID, epoch)
-            self.modules.eval()
-            avg_valid_loss = 0.0
-            with torch.no_grad():
-                for batch in tqdm(
-                    valid_set,
-                    dynamic_ncols=True,
-                    disable=not enable,
-                    colour=self.tqdm_barcolor["valid"],
-                ):
-                    self.step += 1
-                    loss = self.evaluate_batch(batch, stage=Stage.VALID)
-                    avg_valid_loss = self.update_average(loss, avg_valid_loss)
 
-                    # Debug mode only runs a few batches
-                    if self.debug and self.step == self.debug_batches:
-                        break
+    def build_faiss_index(self, target_train_set, enable):
+        print("[BUILD FAISS INDEX] INGESTING TARGET ENCODER INTO INDEX...")
+        faiss_index = faiss.IndexFlatL2(576000)
+        target_pool = []
+        with tqdm(
+            target_train_set,
+            total=len(target_train_data),
+            initial=self.step,
+            dynamic_ncols=True,
+            disable=not enable,
+            colour=self.tqdm_barcolor["train"],
+        ) as t:
+            for target_batch in t:
+                target_batch = target_batch.to(self.device)
+                target_wavs, target_wav_lens = target_batch.sig
+                target_bos_tokens, target_bos_tokens_lens = target_batch.tokens_bos
 
-                self.step = 0
-                self.on_stage_end(Stage.VALID, avg_valid_loss, epoch)
-    
-    @torch.no_grad()
-    def evaluate_batch(self, source_batch, target_batch, stage):
-        """Evaluate one batch, override for different procedure than train.
-
-        The default implementation depends on two methods being defined
-        with a particular behavior:
-
-        * ``compute_forward()``
-        * ``compute_objectives()``
-
-        Arguments
-        ---------
-        batch : list of torch.Tensors
-            Batch of data to use for evaluation. Default implementation assumes
-            this batch has two elements: inputs and targets.
-        stage : Stage
-            The stage of the experiment: Stage.VALID, Stage.TEST
-
-        Returns
-        -------
-        detached loss
-        """
-        amp = AMPConfig.from_name(self.eval_precision)
-        if stage == Stage.TRAIN:
-            if self.use_amp:
-                with torch.autocast(
-                    dtype=amp.dtype, device_type=torch.device(self.device).type
-                ):
-                    source_outputs = self.compute_forward(source_batch=source_batch, target_batch=target_batch, stage=sb.Stage.TRAIN)
-                    source_loss = self.compute_objectives(
-                        source_predictions=source_outputs, 
-                        source_batch=source_batch, 
-                        target_prediction=source_outputs,
-                        target_batch=target_batch,
-                        stage=sb.Stage.TRAIN
-                    )
-            else:
-                source_outputs = self.compute_forward(source_batch=source_batch, target_batch=target_batch, stage=sb.Stage.TRAIN)
-                source_loss = self.compute_objectives(
-                    source_predictions=source_outputs, 
-                    source_batch=source_batch, 
-                    target_prediction=source_outputs,
-                    target_batch=target_batch,
-                    stage=sb.Stage.TRAIN
+                # We compute the padding mask and replace the values with the pad_token_id
+                # that the Whisper decoder expect to see.
+                target_abs_tokens_lens = (target_bos_tokens_lens * target_bos_tokens.shape[1]).long()
+                pad_mask = (
+                    torch.arange(target_abs_tokens_lens.max(), device=self.device)[None, :]
+                    < target_abs_tokens_lens[:, None]
                 )
-        elif stage != Stage.TRAIN:
-            if self.use_amp:
-                with torch.autocast(
-                    dtype=amp.dtype, device_type=torch.device(self.device).type
-                ):
-                    source_outputs = self.compute_forward(source_batch=source_batch, target_batch=None, stage=sb.Stage.VALID)
-                    source_loss = self.compute_objectives(
-                        source_predictions=source_outputs, 
-                        source_batch=source_batch, 
-                        target_prediction=source_outputs,
-                        target_batch=None,
-                        stage=sb.Stage.VALID
-                    )
-            else:
-                source_outputs = self.compute_forward(source_batch=source_batch, target_batch=None, stage=sb.Stage.VALID)
-                source_loss = self.compute_objectives(
-                    source_predictions=source_outputs, 
-                    source_batch=source_batch, 
-                    target_prediction=source_outputs,
-                    target_batch=None,
-                    stage=sb.Stage.VALID
-                )
-        return source_loss.detach().cpu()
+                target_bos_tokens[~pad_mask] = self.tokenizer.pad_token_id
+
+                # Forward encoder + decoder
+                target_enc_out, target_logits, _ = self.modules.whisper(target_wavs, target_bos_tokens)
+                target_embedding = target_enc_out.detach().cpu().numpy()                        # (batchsize, 1500, 384)
+                target_embedding = target_embedding.reshape((target_embedding.shape[0], -1))    # (batchsize, 576000)
+                target_pool.append(target_embedding)
+        target_pool = np.vstack(target_pool)        
+        # print(f"[BUILD FAISS INDEX] TARGET POOL: {target_pool.shape}")
+        faiss_index.add(target_embedding)
+        # print(f"[BUILD FAISS INDEX] FAISS TOTAL: {faiss_index.ntotal}")
+            
+        return faiss_index
     
     def _fit_train(self, source_train_set, target_train_set, epoch, enable):
         # Training stage
@@ -479,9 +454,7 @@ class ASR(sb.Brain):
         # Time since last intra-epoch checkpoint
         last_ckpt_time = time.time()
         steps_since_ckpt = 0
-        
-        # TODO: Implement source and target data combination percentage base here
-        
+        faiss_index = self.build_faiss_index(target_train_set=target_train_set, enable=enable)
         with tqdm(
             zip(source_train_set, target_train_set),
             total=len(source_train_data) + len(target_train_data),
@@ -498,7 +471,7 @@ class ASR(sb.Brain):
                     break
                 self.step += 1
                 steps_since_ckpt += 1
-                loss = self.fit_batch(source_batch=source_batch, target_batch=target_batch)
+                loss = self.fit_batch(source_batch=source_batch, target_batch=target_batch, faiss_index=faiss_index)
                 self.avg_train_loss = self.update_average(
                     loss, self.avg_train_loss
                 )
@@ -527,11 +500,11 @@ class ASR(sb.Brain):
 
         # Run train "on_stage_end" on all processes
         self.zero_grad(set_to_none=True)  # flush gradients
-        # self.on_stage_end(Stage.TRAIN, self.avg_train_loss, epoch)
+        self.on_stage_end(Stage.TRAIN, self.avg_train_loss, epoch)
         self.avg_train_loss = 0.0
         self.step = 0
 
-    def fit_batch(self, source_batch, target_batch):
+    def fit_batch(self, source_batch, target_batch, faiss_index):
         """Fit one batch, override to do multiple updates.
 
         The default implementation depends on a few methods being defined
@@ -561,39 +534,116 @@ class ASR(sb.Brain):
                 with torch.autocast(
                     dtype=amp.dtype, device_type=torch.device(self.device).type
                 ):
-                    source_outputs = self.compute_forward(source_batch=source_batch, target_batch=target_batch, stage=sb.Stage.TRAIN)
-                    source_loss = self.compute_objectives(
+                    source_outputs, target_outputs = self.compute_forward(source_batch=source_batch, target_batch=target_batch, faiss_index=faiss_index, faiss_k=1, stage=Stage.TRAIN)
+                    source_loss, target_loss = self.compute_objectives(
                         source_predictions=source_outputs, 
                         source_batch=source_batch, 
-                        target_prediction=source_outputs,
+                        target_prediction=target_outputs,
                         target_batch=target_batch,
-                        stage=sb.Stage.TRAIN
+                        stage=Stage.TRAIN
                     )
             else:
-                source_outputs = self.compute_forward(source_batch=source_batch, target_batch=target_batch, stage=sb.Stage.TRAIN)
-                source_loss = self.compute_objectives(
+                source_outputs, target_outputs = self.compute_forward(source_batch=source_batch, target_batch=target_batch, faiss_index=faiss_index, faiss_k=1, stage=Stage.TRAIN)
+                source_loss, target_loss = self.compute_objectives(
                     source_predictions=source_outputs, 
                     source_batch=source_batch, 
-                    target_prediction=source_outputs,
+                    target_prediction=target_outputs,
                     target_batch=target_batch,
-                    stage=sb.Stage.TRAIN
+                    stage=Stage.TRAIN
                 )
 
             scaled_source_loss = self.scaler.scale(
                 source_loss / self.grad_accumulation_factor
             )
             self.check_loss_isfinite(scaled_source_loss)
-            scaled_source_loss.backward()
+            
+            scaled_target_loss = self.scaler.scale(
+                target_loss.mean() / self.grad_accumulation_factor
+            )
+            self.check_loss_isfinite(scaled_target_loss)
+            
+            loss = scaled_source_loss + scaled_target_loss
+            loss.backward()
 
         if should_step:
             self.optimizers_step()
 
         self.on_fit_batch_end(source_batch, source_outputs, source_loss, should_step)
+        return loss.detach().cpu()
+    
+    def _fit_valid(self, valid_set, epoch, enable):
+        # Validation stage
+        if valid_set is not None:
+            self.on_stage_start(Stage.VALID, epoch)
+            self.modules.eval()
+            avg_valid_loss = 0.0
+            with torch.no_grad():
+                for batch in tqdm(
+                    valid_set,
+                    dynamic_ncols=True,
+                    disable=not enable,
+                    colour=self.tqdm_barcolor["valid"],
+                ):
+                    self.step += 1
+                    loss = self.evaluate_batch(batch, stage=Stage.VALID)
+                    avg_valid_loss = self.update_average(loss, avg_valid_loss)
+
+                    # Debug mode only runs a few batches
+                    if self.debug and self.step == self.debug_batches:
+                        break
+
+                self.step = 0
+                self.on_stage_end(Stage.VALID, avg_valid_loss, epoch)
+    
+    @torch.no_grad()
+    def evaluate_batch(self, source_batch, stage):
+        """Evaluate one batch, override for different procedure than train.
+
+        The default implementation depends on two methods being defined
+        with a particular behavior:
+
+        * ``compute_forward()``
+        * ``compute_objectives()``
+
+        Arguments
+        ---------
+        batch : list of torch.Tensors
+            Batch of data to use for evaluation. Default implementation assumes
+            this batch has two elements: inputs and targets.
+        stage : Stage
+            The stage of the experiment: Stage.VALID, Stage.TEST
+
+        Returns
+        -------
+        detached loss
+        """
+        amp = AMPConfig.from_name(self.eval_precision)
+        if self.use_amp:
+            with torch.autocast(
+                dtype=amp.dtype, device_type=torch.device(self.device).type
+            ):
+                source_outputs, target_outputs = self.compute_forward(source_batch=source_batch, target_batch=None, faiss_index=None, faiss_k=1, stage=stage)
+                source_loss, target_loss = self.compute_objectives(
+                    source_predictions=source_outputs, 
+                    source_batch=source_batch, 
+                    target_prediction=target_outputs,
+                    target_batch=None,
+                    stage=stage
+                )
+        else:
+            source_outputs, target_outputs = self.compute_forward(source_batch=source_batch, target_batch=None, faiss_index=None, faiss_k=1, stage=stage)
+            source_loss, target_loss = self.compute_objectives(
+                source_predictions=source_outputs, 
+                source_batch=source_batch, 
+                target_prediction=target_outputs,
+                target_batch=None,
+                stage=stage
+            )
         return source_loss.detach().cpu()
     
     def on_stage_start(self, stage, epoch):
         """Gets called at the beginning of each epoch"""
-        if stage != sb.Stage.TRAIN:
+        if stage != Stage.TRAIN:
             self.cer_metric = self.hparams.cer_computer()
             self.wer_metric = self.hparams.error_rate_computer()
 
@@ -601,14 +651,14 @@ class ASR(sb.Brain):
         """Gets called at the end of an epoch."""
         # Compute/store important stats
         stage_stats = {"loss": stage_loss}
-        if stage == sb.Stage.TRAIN:
+        if stage == Stage.TRAIN:
             self.train_stats = stage_stats
         else:
             stage_stats["CER"] = self.cer_metric.summarize("error_rate")
             stage_stats["WER"] = self.wer_metric.summarize("error_rate")
 
         # Perform end-of-iteration things, like annealing, logging, etc.
-        if stage == sb.Stage.VALID:
+        if stage == Stage.VALID:
             lr = self.hparams.lr_annealing_whisper.current_lr
             self.hparams.train_logger.log_stats(
                 stats_meta={"epoch": epoch, "lr": lr},
@@ -619,7 +669,7 @@ class ASR(sb.Brain):
                 meta={"WER": stage_stats["WER"]},
                 min_keys=["WER"],
             )
-        elif stage == sb.Stage.TEST:
+        elif stage == Stage.TEST:
             self.hparams.train_logger.log_stats(
                 stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
                 test_stats=stage_stats,
