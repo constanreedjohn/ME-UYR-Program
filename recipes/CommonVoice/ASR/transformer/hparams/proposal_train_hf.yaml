@@ -20,18 +20,18 @@ whisper_hub: openai/whisper-tiny
 normalized_transcripts: True
 
 # Data files
-language: vi # use 'it' for italian, 'fr' for french, 'en' for english , It is a language for common-voice data.
-data_folder: /Users/codelink/Desktop/Projects/ICASSP/data/cv-corpus-17.0-2024-03-15/vi
-source_train_tsv_file: !ref <data_folder>/train.tsv  # Standard CommonVoice .tsv files
-target_train_tsv_file: !ref <data_folder>/train.tsv  # Standard CommonVoice .tsv files
-dev_tsv_file: !ref <data_folder>/dev.tsv  # Standard CommonVoice .tsv files
-test_tsv_file: !ref <data_folder>/test.tsv  # Standard CommonVoice .tsv files
+language: da # use 'it' for italian, 'fr' for french, 'en' for english , It is a language for common-voice data.
+data_folder: /Users/codelink/Desktop/Projects/ICASSP/data/cv-corpus-17.0-2024-03-15
+source_train_tsv_file: !ref <data_folder>/vi/train.tsv  # Standard CommonVoice .tsv files
+target_train_tsv_file: !ref <data_folder>/da/train.tsv  # Standard CommonVoice .tsv files
+dev_tsv_file: !ref <data_folder>/da/dev.tsv  # Standard CommonVoice .tsv files
+test_tsv_file: !ref <data_folder>/da/test.tsv  # Standard CommonVoice .tsv files
 accented_letters: True
-source_train_csv: !ref <data_folder>/prepared/train.csv
-target_train_csv: !ref <data_folder>/prepared/train.csv
-valid_csv: !ref <data_folder>/prepared/dev.csv
-test_csv: !ref <data_folder>/prepared/test.csv
-skip_prep: False # Skip data preparation
+source_train_csv: !ref <data_folder>/vi/prepared/train.csv
+target_train_csv: !ref <data_folder>/da/prepared/train.csv
+valid_csv: !ref <data_folder>/da/prepared/dev.csv
+test_csv: !ref <data_folder>/da/prepared/test.csv
+skip_prep: True # Skip data preparation
 
 # We remove utterance slonger than 10s in the train/dev/test sets as
 # longer sentences certainly correspond to "open microphones".
@@ -42,7 +42,7 @@ ckpt_interval_minutes: 30 # save checkpoint every N min
 ####################### Training Parameters ####################################
 freeze_whisper: False
 freeze_encoder: True
-number_of_epochs: 1
+number_of_epochs: 5
 weight_decay: 0.01
 lr_whisper: 1e-5
 warmup_steps: 500

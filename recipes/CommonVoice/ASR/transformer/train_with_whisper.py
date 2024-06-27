@@ -174,7 +174,7 @@ class ASR(sb.Brain):
             target_batch = target_batch.to(self.device)
             target_loss = _get_entropy_batch(combine_log_probs)
             # print(f"[COMPUTE_OBJECTIVE] TARGET ENTROPY: {target_entropy} - {type(target_entropy)} - {target_entropy.shape}")
-        
+
         if stage != Stage.TRAIN:
             tokens, tokens_lens = source_batch.tokens
 
@@ -293,9 +293,7 @@ class ASR(sb.Brain):
         valid_set=None,
         progressbar=None,
         train_loader_kwargs={},
-        valid_loader_kwargs={},
-        faiss_num_query=1000,
-        faiss_db_size=1000
+        valid_loader_kwargs={}
     ):
         """Iterate epochs and datasets to improve objective.
 
@@ -431,9 +429,9 @@ class ASR(sb.Brain):
                 target_embedding = target_embedding.reshape((target_embedding.shape[0], -1))    # (batchsize, 576000)
                 target_pool.append(target_embedding)
         target_pool = np.vstack(target_pool)        
-        # print(f"[BUILD FAISS INDEX] TARGET POOL: {target_pool.shape}")
+        print(f"[BUILD FAISS INDEX] TARGET POOL: {target_pool.shape}")
         faiss_index.add(target_embedding)
-        # print(f"[BUILD FAISS INDEX] FAISS TOTAL: {faiss_index.ntotal}")
+        print(f"[BUILD FAISS INDEX] FAISS TOTAL: {faiss_index.ntotal}")
             
         return faiss_index
     
@@ -594,6 +592,74 @@ class ASR(sb.Brain):
 
                 self.step = 0
                 self.on_stage_end(Stage.VALID, avg_valid_loss, epoch)
+                
+    def evaluate(
+        self,
+        test_set,
+        max_key=None,
+        min_key=None,
+        progressbar=None,
+        test_loader_kwargs={},
+    ):
+        """Iterate test_set and evaluate brain performance. By default, loads
+        the best-performing checkpoint (as recorded using the checkpointer).
+
+        Arguments
+        ---------
+        test_set : Dataset, DataLoader
+            If a DataLoader is given, it is iterated directly. Otherwise passed
+            to ``self.make_dataloader()``.
+        max_key : str
+            Key to use for finding best checkpoint, passed to
+            ``on_evaluate_start()``.
+        min_key : str
+            Key to use for finding best checkpoint, passed to
+            ``on_evaluate_start()``.
+        progressbar : bool
+            Whether to display the progress in a progressbar.
+        test_loader_kwargs : dict
+            Kwargs passed to ``make_dataloader()`` if ``test_set`` is not a
+            DataLoader. NOTE: ``loader_kwargs["ckpt_prefix"]`` gets
+            automatically overwritten to ``None`` (so that the test DataLoader
+            is not added to the checkpointer).
+
+        Returns
+        -------
+        average test loss
+        """
+        if progressbar is None:
+            progressbar = not self.noprogressbar
+
+        if not (
+            isinstance(test_set, DataLoader)
+            or isinstance(test_set, LoopedLoader)
+        ):
+            test_loader_kwargs["ckpt_prefix"] = None
+            test_set = self.make_dataloader(
+                test_set, Stage.TEST, **test_loader_kwargs
+            )
+        self.on_evaluate_start(max_key=max_key, min_key=min_key)
+        self.on_stage_start(Stage.TEST, epoch=None)
+        self.modules.eval()
+        avg_test_loss = 0.0
+        with torch.no_grad():
+            for batch in tqdm(
+                test_set,
+                dynamic_ncols=True,
+                disable=not progressbar,
+                colour=self.tqdm_barcolor["test"],
+            ):
+                self.step += 1
+                loss = self.evaluate_batch(batch, stage=Stage.TEST)
+                avg_test_loss = self.update_average(loss, avg_test_loss)
+
+                # Debug mode only runs a few batches
+                if self.debug and self.step == self.debug_batches:
+                    break
+
+            self.on_stage_end(Stage.TEST, avg_test_loss, None)
+        self.step = 0
+        return avg_test_loss
     
     @torch.no_grad()
     def evaluate_batch(self, source_batch, stage):
@@ -849,16 +915,17 @@ if __name__ == "__main__":
     asr_brain.tokenizer = tokenizer
 
     # Training
-    asr_brain.fit(
-        asr_brain.hparams.epoch_counter,
-        source_train_data,
-        target_train_data,
-        valid_data,
-        train_loader_kwargs=hparams["train_loader_kwargs"],
-        valid_loader_kwargs=hparams["valid_loader_kwargs"],
-    )
-"""
-    # Testing
+    with torch.autograd.detect_anomaly():
+        asr_brain.fit(
+            asr_brain.hparams.epoch_counter,
+            source_train_data,
+            target_train_data,
+            valid_data,
+            train_loader_kwargs=hparams["train_loader_kwargs"],
+            valid_loader_kwargs=hparams["valid_loader_kwargs"],
+        )
+
+    # # Testing
     asr_brain.hparams.test_wer_file = hparams["test_wer_file"]
     asr_brain.evaluate(
         test_data,
@@ -872,4 +939,3 @@ if __name__ == "__main__":
         min_key="WER",
         test_loader_kwargs=hparams["test_loader_kwargs"],
     )
-"""
