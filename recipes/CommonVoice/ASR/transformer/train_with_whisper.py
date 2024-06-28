@@ -24,6 +24,7 @@ from enum import Enum, auto
 from dataclasses import dataclass
 from hyperpyyaml import load_hyperpyyaml
 
+from torch import nn
 from torch.utils.data import DataLoader
 
 import speechbrain as sb
@@ -106,14 +107,26 @@ class ASR(sb.Brain):
         source_bos_tokens[~pad_mask] = self.tokenizer.pad_token_id
 
         # Forward encoder + decoder
-        target_enc_out = None
         source_enc_out, source_logits, _ = self.modules.whisper(source_wavs, source_bos_tokens)
         source_log_probs = self.hparams.log_softmax(source_logits)
         # print(f"[COMPUTE_FORWARD] SOURCE ENCODER OUTPUT: {source_enc_out} - {type(source_enc_out)} - {source_enc_out.shape}")
         
         if stage == Stage.TRAIN:
-            target_wavs, target_wav_lens = target_batch.sig
+            # Get target logits
+            self.modules.eval()
+            with torch.no_grad():
+                target_batch = target_batch.to(self.device)
+                target_wavs, target_wav_lens = target_batch.sig
+                target_bos_tokens, target_bos_tokens_lens = target_batch.tokens_bos
+                target_abs_tokens_lens = (target_bos_tokens_lens * target_bos_tokens.shape[1]).long()
+                pad_mask = (
+                    torch.arange(target_abs_tokens_lens.max(), device=self.device)[None, :]
+                    < target_abs_tokens_lens[:, None]
+                )
+                target_bos_tokens[~pad_mask] = self.tokenizer.pad_token_id
+                target_enc_out, target_logits, _ = self.modules.whisper(target_wavs, target_bos_tokens)
             
+            self.modules.train()
             source_embedding = source_enc_out.detach().cpu().numpy()    # (batchsize, 1500, 384)
             source_embedding = source_embedding.reshape((source_embedding.shape[0], -1)) # (batchsize, 576000)
             
@@ -123,17 +136,18 @@ class ASR(sb.Brain):
             # print(f"[COMPUTER_FORWARD] FAISS SAMPLE ID: {faiss_sample} - {faiss_sample.shape}")
             simliarity = [faiss_index.reconstruct_batch(i.shape[0]) for i in faiss_sample]
             simliarity = np.asarray(simliarity)
-            simliarity = simliarity.reshape((simliarity.shape[0], 1500, 384))
+            simliarity = simliarity.reshape((simliarity.shape[0], 1500, 384)) # (batchsize, 576000) -> (batchsize, 1500, 384)
             
             # print(f"[COMPUTER_FORWARD] FAISS RECONSTRUCT: {simliarity} - {simliarity.shape}")
             target_filtered = torch.tensor(simliarity, dtype=torch.float32)
             target_filtered = target_filtered.to(self.device)
-            target_log_probs = source_enc_out + target_filtered
+            combined_logits = source_enc_out + target_filtered
             
             # print(f"[COMPUTER_FORWARD] COMBINATION BETWEEN SOURCE AND TARGET WITH BATCH OF {source_enc_out.shape[0]}: {target_log_probs.shape}")
-            target_log_probs = torch.nn.functional.relu(target_log_probs)
+            # target_log_probs = torch.nn.functional.relu(target_logits)
+            # target_log_probs = self.hparams.log_softmax(target_logits)
             
-            return [source_log_probs, None, source_wav_lens], [target_log_probs, target_wav_lens]
+            return [source_log_probs, None, source_wav_lens], [combined_logits, source_enc_out, target_enc_out]
         
         hyps = None
         if stage == Stage.VALID:
@@ -146,11 +160,7 @@ class ASR(sb.Brain):
         return [source_log_probs, hyps, source_wav_lens], []
 
     def compute_objectives(self, source_predictions, target_prediction, source_batch, target_batch, stage):
-        def _get_entropy_batch(p_softmax):
-            p_softmax = p_softmax.view(-1, p_softmax.shape[-1])
-            entropy = - torch.mul(p_softmax, torch.log(p_softmax + 1e-7))
-            entropy =  torch.sum(entropy, dim=1)
-            return entropy
+        triplet_loss = nn.TripletMarginLoss()
         """Computes the loss NLL given predictions and targets."""
         
         (source_log_probs, hyps, source_wav_lens) = source_predictions
@@ -164,17 +174,15 @@ class ASR(sb.Brain):
             source_tokens_eos_lens = self.hparams.wav_augment.replicate_labels(
                 source_tokens_eos_lens
             )
-        
         source_loss = self.hparams.nll_loss(
             source_log_probs, source_tokens_eos, length=source_tokens_eos_lens
         )
         target_loss = 0.0
         if stage == Stage.TRAIN:
-            (combine_log_probs, combine_wav_lens) = target_prediction
+            (combine_logits, source_logits, target_logits) = target_prediction
             target_batch = target_batch.to(self.device)
-            target_loss = _get_entropy_batch(combine_log_probs)
-            # print(f"[COMPUTE_OBJECTIVE] TARGET ENTROPY: {target_entropy} - {type(target_entropy)} - {target_entropy.shape}")
-
+            target_loss = triplet_loss(combine_logits, target_logits, source_logits)
+        
         if stage != Stage.TRAIN:
             tokens, tokens_lens = source_batch.tokens
 
@@ -430,7 +438,7 @@ class ASR(sb.Brain):
                 target_pool.append(target_embedding)
         target_pool = np.vstack(target_pool)        
         print(f"[BUILD FAISS INDEX] TARGET POOL: {target_pool.shape}")
-        faiss_index.add(target_embedding)
+        faiss_index.add(target_pool)
         print(f"[BUILD FAISS INDEX] FAISS TOTAL: {faiss_index.ntotal}")
             
         return faiss_index
@@ -559,7 +567,7 @@ class ASR(sb.Brain):
                 target_loss.mean() / self.grad_accumulation_factor
             )
             self.check_loss_isfinite(scaled_target_loss)
-            
+            print(f"[FIT_BATCH] SOURCE_LOSS: {scaled_source_loss} - TARGET_LOSS: {scaled_target_loss}")
             loss = scaled_source_loss + scaled_target_loss
             loss.backward()
 
