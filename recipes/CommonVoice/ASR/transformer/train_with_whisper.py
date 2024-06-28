@@ -141,13 +141,16 @@ class ASR(sb.Brain):
             # print(f"[COMPUTER_FORWARD] FAISS RECONSTRUCT: {simliarity} - {simliarity.shape}")
             target_filtered = torch.tensor(simliarity, dtype=torch.float32)
             target_filtered = target_filtered.to(self.device)
-            combined_logits = source_enc_out + target_filtered
+            retrieved_target = target_filtered
             
             # print(f"[COMPUTER_FORWARD] COMBINATION BETWEEN SOURCE AND TARGET WITH BATCH OF {source_enc_out.shape[0]}: {target_log_probs.shape}")
             # target_log_probs = torch.nn.functional.relu(target_logits)
             # target_log_probs = self.hparams.log_softmax(target_logits)
+            if retrieved_target.shape != source_enc_out.shape != target_enc_out.shape:
+                logger.info(f"[COMPUTE_OBJECTS] DIFF DIMENSION WHERE COMBINE: {retrieved_target.shape} - SOURCE: {source_logits.shape} - TARGET: {target_logits.shape}")
+                return [source_log_probs, None, source_wav_lens], [torch.rand([source_enc_out.shape[0], 1500, 384]), torch.rand([source_enc_out.shape[0], 1500, 384]), torch.rand([source_enc_out.shape[0], 1500, 384])]
             
-            return [source_log_probs, None, source_wav_lens], [combined_logits, source_enc_out, target_enc_out]
+            return [source_log_probs, None, source_wav_lens], [retrieved_target, source_enc_out, target_enc_out]
         
         hyps = None
         if stage == Stage.VALID:
@@ -179,9 +182,9 @@ class ASR(sb.Brain):
         )
         target_loss = 0.0
         if stage == Stage.TRAIN:
-            (combine_logits, source_logits, target_logits) = target_prediction
+            (retrieved_logits, source_logits, target_logits) = target_prediction
             target_batch = target_batch.to(self.device)
-            target_loss = triplet_loss(combine_logits, target_logits, source_logits)
+            target_loss = triplet_loss(retrieved_logits, target_logits, source_logits)
         
         if stage != Stage.TRAIN:
             tokens, tokens_lens = source_batch.tokens
@@ -567,7 +570,7 @@ class ASR(sb.Brain):
                 target_loss.mean() / self.grad_accumulation_factor
             )
             self.check_loss_isfinite(scaled_target_loss)
-            print(f"[FIT_BATCH] SOURCE_LOSS: {scaled_source_loss} - TARGET_LOSS: {scaled_target_loss}")
+            logger.info(f"[FIT_BATCH] SOURCE_LOSS: {scaled_source_loss} - TARGET_LOSS: {scaled_target_loss}\n")
             loss = scaled_source_loss + scaled_target_loss
             loss.backward()
 
