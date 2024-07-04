@@ -417,7 +417,7 @@ class ASR(sb.Brain):
         target_pool = []
         with tqdm(
             target_train_set,
-            total=len(target_train_data),
+            total=len(target_train_set),
             initial=self.step,
             dynamic_ncols=True,
             disable=not enable,
@@ -468,7 +468,7 @@ class ASR(sb.Brain):
         steps_since_ckpt = 0
         with tqdm(
             zip(source_train_set, target_train_set),
-            total=len(source_train_data) + len(target_train_data),
+            total=len(source_train_set) + len(target_train_set),
             initial=self.step,
             dynamic_ncols=True,
             disable=not enable,
