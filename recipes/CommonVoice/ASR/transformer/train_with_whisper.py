@@ -40,7 +40,8 @@ class Stage(Enum):
 
     TRAIN = auto()
     VALID = auto()
-    TEST = auto()
+    SOURCE_TEST = auto()
+    TARGET_TEST = auto()
     
 @dataclass
 class AMPConfig:
@@ -157,7 +158,7 @@ class ASR(sb.Brain):
             hyps, _, _, _ = self.hparams.valid_search(
                 source_enc_out.detach(), source_wav_lens
             )
-        elif stage == Stage.TEST:
+        elif stage in [Stage.SOURCE_TEST, Stage.TARGET_TEST]:
             hyps, _, _, _ = self.hparams.test_search(source_enc_out.detach(), source_wav_lens)
 
         return [source_log_probs, hyps, source_wav_lens], []
@@ -184,7 +185,7 @@ class ASR(sb.Brain):
         if stage == Stage.TRAIN:
             (retrieved_logits, source_logits, target_logits) = target_prediction
             target_batch = target_batch.to(self.device)
-            target_loss = triplet_loss(retrieved_logits, target_logits, source_logits)
+            target_loss = triplet_loss(source_logits, retrieved_logits, target_logits)
         
         if stage != Stage.TRAIN:
             tokens, tokens_lens = source_batch.tokens
@@ -217,8 +218,8 @@ class ASR(sb.Brain):
 
             self.wer_metric.append(ids, predicted_words, target_words)
             self.cer_metric.append(ids, predicted_words, target_words)
-            print(f"[COMPUTE OBJECTIVES] LABEL: {target_words}")
-            print(f"[COMPUTE OBJECTIVES] PREDICTED: {predicted_words}")
+            # print(f"[COMPUTE OBJECTIVES] LABEL: {target_words}")
+            # print(f"[COMPUTE OBJECTIVES] PREDICTED: {predicted_words}")
 
         return source_loss, target_loss
     
@@ -390,12 +391,14 @@ class ASR(sb.Brain):
 
         # Only show progressbar if requested and main_process
         enable = progressbar and sb.utils.distributed.if_main_process()
+        faiss_index = self.build_faiss_index(target_train_set=target_train_set, enable=enable)
         # Iterate epochs
         for epoch in epoch_counter:
             self._fit_train(
                 source_train_set=source_train_set, 
                 target_train_set=target_train_set,
                 epoch=epoch, 
+                faiss_index=faiss_index,
                 enable=enable
             )
             self._fit_valid(valid_set=valid_set, epoch=epoch, enable=enable)
@@ -446,7 +449,7 @@ class ASR(sb.Brain):
             
         return faiss_index
     
-    def _fit_train(self, source_train_set, target_train_set, epoch, enable):
+    def _fit_train(self, source_train_set, target_train_set, epoch, enable, faiss_index):
         # Training stage
         self.on_stage_start(Stage.TRAIN, epoch)
         self.modules.train()
@@ -463,7 +466,6 @@ class ASR(sb.Brain):
         # Time since last intra-epoch checkpoint
         last_ckpt_time = time.time()
         steps_since_ckpt = 0
-        faiss_index = self.build_faiss_index(target_train_set=target_train_set, enable=enable)
         with tqdm(
             zip(source_train_set, target_train_set),
             total=len(source_train_data) + len(target_train_data),
@@ -607,6 +609,7 @@ class ASR(sb.Brain):
     def evaluate(
         self,
         test_set,
+        stage,
         max_key=None,
         min_key=None,
         progressbar=None,
@@ -647,10 +650,10 @@ class ASR(sb.Brain):
         ):
             test_loader_kwargs["ckpt_prefix"] = None
             test_set = self.make_dataloader(
-                test_set, Stage.TEST, **test_loader_kwargs
+                test_set, stage, **test_loader_kwargs
             )
         self.on_evaluate_start(max_key=max_key, min_key=min_key)
-        self.on_stage_start(Stage.TEST, epoch=None)
+        self.on_stage_start(stage, epoch=None)
         self.modules.eval()
         avg_test_loss = 0.0
         with torch.no_grad():
@@ -661,14 +664,14 @@ class ASR(sb.Brain):
                 colour=self.tqdm_barcolor["test"],
             ):
                 self.step += 1
-                loss = self.evaluate_batch(batch, stage=Stage.TEST)
+                loss = self.evaluate_batch(batch, stage=stage)
                 avg_test_loss = self.update_average(loss, avg_test_loss)
 
                 # Debug mode only runs a few batches
                 if self.debug and self.step == self.debug_batches:
                     break
 
-            self.on_stage_end(Stage.TEST, avg_test_loss, None)
+            self.on_stage_end(stage, avg_test_loss, None)
         self.step = 0
         return avg_test_loss
     
@@ -725,6 +728,7 @@ class ASR(sb.Brain):
             self.wer_metric = self.hparams.error_rate_computer()
 
     def on_stage_end(self, stage, stage_loss, epoch):
+        print(stage)
         """Gets called at the end of an epoch."""
         # Compute/store important stats
         stage_stats = {"loss": stage_loss}
@@ -746,14 +750,24 @@ class ASR(sb.Brain):
                 meta={"WER": stage_stats["WER"]},
                 min_keys=["WER"],
             )
-        elif stage == Stage.TEST:
+        elif stage == Stage.SOURCE_TEST:
             self.hparams.train_logger.log_stats(
                 stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
                 test_stats=stage_stats,
             )
             if if_main_process():
-                with open(self.hparams.test_wer_file, "w") as w:
+                with open(self.hparams.source_test_wer_file, "w") as w:
                     self.wer_metric.write_stats(w)
+                    
+        elif stage == Stage.TARGET_TEST:
+            self.hparams.train_logger.log_stats(
+                stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
+                test_stats=stage_stats,
+            )
+            if if_main_process():
+                with open(self.hparams.target_test_wer_file, "w") as w:
+                    self.wer_metric.write_stats(w)
+            
 
 
 def dataio_prepare(hparams, tokenizer):
@@ -813,12 +827,17 @@ def dataio_prepare(hparams, tokenizer):
     valid_data = valid_data.filtered_sorted(sort_key="duration")
 
     # test is separate
-    test_data = sb.dataio.dataset.DynamicItemDataset.from_csv(
-        csv_path=hparams["test_csv"],
+    target_test_data = sb.dataio.dataset.DynamicItemDataset.from_csv(
+        csv_path=hparams["target_test_csv"],
+        replacements={"data_root": data_folder},
+    )
+    
+    source_test_data = sb.dataio.dataset.DynamicItemDataset.from_csv(
+        csv_path=hparams["source_test_csv"],
         replacements={"data_root": data_folder},
     )
 
-    datasets = [source_train_data, target_train_data, valid_data, test_data]
+    datasets = [source_train_data, target_train_data, valid_data, target_test_data, source_test_data]
 
     # 2. Define audio pipeline:
     @sb.utils.data_pipeline.takes("wav")
@@ -861,7 +880,7 @@ def dataio_prepare(hparams, tokenizer):
         ["id", "sig", "tokens_list", "tokens_bos", "tokens_eos", "tokens"],
     )
 
-    return source_train_data, target_train_data, valid_data, test_data
+    return source_train_data, target_train_data, valid_data, target_test_data, source_test_data
 
 
 if __name__ == "__main__":
@@ -905,7 +924,7 @@ if __name__ == "__main__":
     tokenizer = hparams["whisper"].tokenizer
 
     # here we create the datasets objects as well as tokenization and encoding
-    source_train_data, target_train_data, valid_data, test_data = dataio_prepare(hparams, tokenizer)
+    source_train_data, target_train_data, valid_data, target_test_data, source_test_data = dataio_prepare(hparams, tokenizer)
 
     # Trainer initialization
     asr_brain = ASR(
@@ -925,6 +944,7 @@ if __name__ == "__main__":
     # NB: This tokenizer corresponds to the one used for Whisper.
     asr_brain.tokenizer = tokenizer
 
+    logger.info(f"[MAIN] TRAINING")
     # Training
     with torch.autograd.detect_anomaly():
         asr_brain.fit(
@@ -937,16 +957,29 @@ if __name__ == "__main__":
         )
 
     # # Testing
-    asr_brain.hparams.test_wer_file = hparams["test_wer_file"]
+    logger.info(f"[MAIN] TESTING TARGET")
+    asr_brain.hparams.target_test_wer_file = hparams["target_test_wer_file"]
     asr_brain.evaluate(
-        test_data,
+        target_test_data,
+        stage=Stage.TARGET_TEST,
+        min_key="WER",
+        test_loader_kwargs=hparams["test_loader_kwargs"],
+    )
+    
+    logger.info(f"[MAIN] TESTING SOURCE")
+    asr_brain.hparams.source_test_wer_file = hparams["source_test_wer_file"]
+    asr_brain.evaluate(
+        source_test_data,
+        stage=Stage.SOURCE_TEST,
         min_key="WER",
         test_loader_kwargs=hparams["test_loader_kwargs"],
     )
 
-    asr_brain.hparams.test_wer_file = hparams["valid_wer_file"]
+    logger.info(f"[MAIN] VALIDATING")
+    asr_brain.hparams.valid_wer_file = hparams["valid_wer_file"]
     asr_brain.evaluate(
         valid_data,
+        stage=Stage.VALID,
         min_key="WER",
-        test_loader_kwargs=hparams["test_loader_kwargs"],
+        test_loader_kwargs=hparams["valid_loader_kwargs"],
     )
