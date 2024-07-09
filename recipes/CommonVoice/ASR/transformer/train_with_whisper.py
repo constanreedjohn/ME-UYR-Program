@@ -13,6 +13,7 @@ Authors
 
 import logging
 import sys
+import os
 
 import torch
 import torchaudio
@@ -297,6 +298,22 @@ class ASR(sb.Brain):
             self.checkpointer.add_recoverable(ckpt_key, dataloader)
         return dataloader
     
+    def load_faiss_index(self, target_train_set, enable):
+        if os.path.exists(os.path.join(hparams['output_folder'], "faiss_index")):
+            files = sorted(os.listdir(os.path.join(hparams['output_folder'], "faiss_index")))
+            if "faiss_index_last.index" in files:
+                logger.info("[FIT] LOADING LAST INDEX")
+                faiss_index = faiss.read_index(os.path.join(hparams['output_folder'], "faiss_index", "faiss_index_last.index"))
+                return faiss_index
+            else:
+                logger.info(f"[FIT] LOADING LATEST INDEX {files[-1]}")
+                faiss_index = faiss.read_index(os.path.join(hparams['output_folder'], "faiss_index", files[-1]))
+                return faiss_index
+        else:
+            logger.info(f"[FIT] NO SAVED INDEX FOUND - CREATING")
+            faiss_index = self.build_faiss_index(target_train_set=target_train_set, enable=enable)
+            return faiss_index
+    
     def fit(
         self,
         epoch_counter,
@@ -391,7 +408,9 @@ class ASR(sb.Brain):
 
         # Only show progressbar if requested and main_process
         enable = progressbar and sb.utils.distributed.if_main_process()
-        faiss_index = self.build_faiss_index(target_train_set=target_train_set, enable=enable)
+        
+        faiss_index = self.load_faiss_index(target_train_set, enable)
+            
         # Iterate epochs
         for epoch in epoch_counter:
             self._fit_train(
@@ -414,7 +433,7 @@ class ASR(sb.Brain):
     def build_faiss_index(self, target_train_set, enable):
         print("[BUILD FAISS INDEX] INGESTING TARGET ENCODER INTO INDEX...")
         faiss_index = faiss.IndexFlatL2(576000)
-        target_pool = []
+        os.makedirs(os.path.join(hparams['output_folder'], "faiss_index"), exist_ok=True)
         with tqdm(
             target_train_set,
             total=len(target_train_set),
@@ -423,7 +442,11 @@ class ASR(sb.Brain):
             disable=not enable,
             colour=self.tqdm_barcolor["train"],
         ) as t:
-            for target_batch in t:
+            for idx, target_batch in enumerate(t):
+                if idx % hparams['save_index_step'] == 0:
+                    logger.info(f"[BUILD FAISS INDEX] SAVING INDEX AT BATCH SIZE INDEX {idx}")
+                    faiss.write_index(faiss_index, os.path.join(hparams['output_folder'], f"faiss_index/faiss_index_{idx}.index"))
+                    
                 target_batch = target_batch.to(self.device)
                 target_wavs, target_wav_lens = target_batch.sig
                 target_bos_tokens, target_bos_tokens_lens = target_batch.tokens_bos
@@ -441,10 +464,10 @@ class ASR(sb.Brain):
                 target_enc_out, target_logits, _ = self.modules.whisper(target_wavs, target_bos_tokens)
                 target_embedding = target_enc_out.detach().cpu().numpy()                        # (batchsize, 1500, 384)
                 target_embedding = target_embedding.reshape((target_embedding.shape[0], -1))    # (batchsize, 576000)
-                target_pool.append(target_embedding)
-        target_pool = np.vstack(target_pool)        
-        print(f"[BUILD FAISS INDEX] TARGET POOL: {target_pool.shape}")
-        faiss_index.add(target_pool)
+                faiss_index.add(target_embedding)
+            
+            logger.info(f"[BUILD FAISS INDEX] SAVING INDEX AT LAST")
+            faiss.write_index(faiss_index, os.path.join(hparams['output_folder'], f"faiss_index/faiss_index_last.index"))
         print(f"[BUILD FAISS INDEX] FAISS TOTAL: {faiss_index.ntotal}")
             
         return faiss_index
