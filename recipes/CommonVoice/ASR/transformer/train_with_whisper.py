@@ -298,7 +298,18 @@ class ASR(sb.Brain):
             self.checkpointer.add_recoverable(ckpt_key, dataloader)
         return dataloader
     
-    def load_faiss_index(self, target_train_set, enable):
+    def load_faiss_index(self, faiss_index_path, target_train_set, enable):
+        if faiss_index_path is not None:
+            files = sorted(os.listdir(faiss_index_path))
+            if "faiss_index_last.index" in files:
+                logger.info("[FIT] LOADING LAST INDEX")
+                faiss_index = faiss.read_index(os.path.join(faiss_index_path, "faiss_index_last.index"))
+                return faiss_index
+            else:
+                logger.info(f"[FIT] LOADING LATEST INDEX {files[-1]}")
+                faiss_index = faiss.read_index(os.path.join(faiss_index_path, files[-1]))
+                return faiss_index
+        
         if os.path.exists(os.path.join(hparams['output_folder'], "faiss_index")):
             files = sorted(os.listdir(os.path.join(hparams['output_folder'], "faiss_index")))
             if "faiss_index_last.index" in files:
@@ -409,7 +420,7 @@ class ASR(sb.Brain):
         # Only show progressbar if requested and main_process
         enable = progressbar and sb.utils.distributed.if_main_process()
         
-        faiss_index = self.load_faiss_index(target_train_set, enable)
+        faiss_index = self.load_faiss_index(hparams['faiss_index_path'], target_train_set, enable)
             
         # Iterate epochs
         for epoch in epoch_counter:
@@ -442,32 +453,34 @@ class ASR(sb.Brain):
             disable=not enable,
             colour=self.tqdm_barcolor["train"],
         ) as t:
-            for idx, target_batch in enumerate(t):
-                if idx % hparams['save_index_step'] == 0:
-                    logger.info(f"[BUILD FAISS INDEX] SAVING INDEX AT BATCH SIZE INDEX {idx}")
-                    faiss.write_index(faiss_index, os.path.join(hparams['output_folder'], f"faiss_index/faiss_index_{idx}.index"))
-                    
-                target_batch = target_batch.to(self.device)
-                target_wavs, target_wav_lens = target_batch.sig
-                target_bos_tokens, target_bos_tokens_lens = target_batch.tokens_bos
+            self.modules.eval()
+            with torch.no_grad():
+                for idx, target_batch in enumerate(t):
+                    if idx % hparams['save_index_step'] == 0:
+                        logger.info(f"[BUILD FAISS INDEX] SAVING INDEX AT BATCH SIZE INDEX {idx}")
+                        faiss.write_index(faiss_index, os.path.join(hparams['output_folder'], f"faiss_index/faiss_index_{idx}.index"))
+                        
+                    target_batch = target_batch.to(self.device)
+                    target_wavs, target_wav_lens = target_batch.sig
+                    target_bos_tokens, target_bos_tokens_lens = target_batch.tokens_bos
 
-                # We compute the padding mask and replace the values with the pad_token_id
-                # that the Whisper decoder expect to see.
-                target_abs_tokens_lens = (target_bos_tokens_lens * target_bos_tokens.shape[1]).long()
-                pad_mask = (
-                    torch.arange(target_abs_tokens_lens.max(), device=self.device)[None, :]
-                    < target_abs_tokens_lens[:, None]
-                )
-                target_bos_tokens[~pad_mask] = self.tokenizer.pad_token_id
+                    # We compute the padding mask and replace the values with the pad_token_id
+                    # that the Whisper decoder expect to see.
+                    target_abs_tokens_lens = (target_bos_tokens_lens * target_bos_tokens.shape[1]).long()
+                    pad_mask = (
+                        torch.arange(target_abs_tokens_lens.max(), device=self.device)[None, :]
+                        < target_abs_tokens_lens[:, None]
+                    )
+                    target_bos_tokens[~pad_mask] = self.tokenizer.pad_token_id
 
-                # Forward encoder + decoder
-                target_enc_out, target_logits, _ = self.modules.whisper(target_wavs, target_bos_tokens)
-                target_embedding = target_enc_out.detach().cpu().numpy()                        # (batchsize, 1500, 384)
-                target_embedding = target_embedding.reshape((target_embedding.shape[0], -1))    # (batchsize, 576000)
-                faiss_index.add(target_embedding)
-            
-            logger.info(f"[BUILD FAISS INDEX] SAVING INDEX AT LAST")
-            faiss.write_index(faiss_index, os.path.join(hparams['output_folder'], f"faiss_index/faiss_index_last.index"))
+                    # Forward encoder + decoder
+                    target_enc_out, target_logits, _ = self.modules.whisper(target_wavs, target_bos_tokens)
+                    target_embedding = target_enc_out.detach().cpu().numpy()                        # (batchsize, 1500, 384)
+                    target_embedding = target_embedding.reshape((target_embedding.shape[0], -1))    # (batchsize, 576000)
+                    faiss_index.add(target_embedding)
+                
+                logger.info(f"[BUILD FAISS INDEX] SAVING INDEX AT LAST")
+                faiss.write_index(faiss_index, os.path.join(hparams['output_folder'], f"faiss_index/faiss_index_last.index"))
         print(f"[BUILD FAISS INDEX] FAISS TOTAL: {faiss_index.ntotal}")
             
         return faiss_index
@@ -801,11 +814,11 @@ def dataio_prepare(hparams, tokenizer):
 
     source_train_data = sb.dataio.dataset.DynamicItemDataset.from_csv(
         csv_path=hparams["source_train_csv"],
-        replacements={"data_root": data_folder},
+        # replacements={"data_root": data_folder},
     )
     target_train_data = sb.dataio.dataset.DynamicItemDataset.from_csv(
         csv_path=hparams["target_train_csv"],
-        replacements={"data_root": data_folder},
+        # replacements={"data_root": data_folder},
     )
 
     if hparams["sorting"] == "ascending":
@@ -836,7 +849,11 @@ def dataio_prepare(hparams, tokenizer):
         hparams["train_loader_kwargs"]["shuffle"] = False
 
     elif hparams["sorting"] == "random":
-        pass
+        source_train_data = source_train_data.filtered_sorted(
+            sort_key="duration",
+            key_max_value={"duration": hparams["avoid_if_longer_than"]},
+        )
+        target_train_data = target_train_data.batch_shuffle(hparams["train_loader_kwargs"]["batch_size"])
 
     else:
         raise NotImplementedError(
@@ -845,19 +862,19 @@ def dataio_prepare(hparams, tokenizer):
 
     valid_data = sb.dataio.dataset.DynamicItemDataset.from_csv(
         csv_path=hparams["valid_csv"],
-        replacements={"data_root": data_folder},
+        # replacements={"data_root": data_folder},
     )
     valid_data = valid_data.filtered_sorted(sort_key="duration")
 
     # test is separate
     target_test_data = sb.dataio.dataset.DynamicItemDataset.from_csv(
         csv_path=hparams["target_test_csv"],
-        replacements={"data_root": data_folder},
+        # replacements={"data_root": data_folder},
     )
     
     source_test_data = sb.dataio.dataset.DynamicItemDataset.from_csv(
         csv_path=hparams["source_test_csv"],
-        replacements={"data_root": data_folder},
+        # replacements={"data_root": data_folder},
     )
 
     datasets = [source_train_data, target_train_data, valid_data, target_test_data, source_test_data]
