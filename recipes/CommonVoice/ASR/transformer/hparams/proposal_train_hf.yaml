@@ -7,10 +7,11 @@
 # Seed needs to be set at top of yaml, before objects with parameters are made
 seed: 1986
 __set_seed: !apply:torch.manual_seed [!ref <seed>]
-output_folder: !ref results/train_whisper/<seed>/CV/no_enc_freeze/da_fr
+output_folder: !ref results/train_whisper/<seed>/CV/no_enc_freeze/vi_pl
 target_test_wer_file: !ref <output_folder>/target_wer_test.txt
 source_test_wer_file: !ref <output_folder>/source_wer_test.txt
-valid_wer_file: !ref <output_folder>/wer_valid.txt
+target_valid_wer_file: !ref <output_folder>/target_wer_valid.txt
+source_valid_wer_file: !ref <output_folder>/source_wer_valid.txt
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
@@ -21,20 +22,26 @@ whisper_hub: openai/whisper-tiny
 normalized_transcripts: True
 
 # Data files
-language: da # use 'it' for italian, 'fr' for french, 'en' for english , It is a language for common-voice data.
-data_folder: /ASR/data/FLEURS
-faiss_index_path: /ASR/transformer/results/train_whisper/1986/CV/no_enc_freeze/vi_fr/faiss_index/
-source_train_tsv_file: !ref <data_folder>/da/train.tsv  # Standard CommonVoice .tsv files
-target_train_tsv_file: !ref <data_folder>/fr/train.tsv  # Standard CommonVoice .tsv files
-dev_tsv_file: !ref <data_folder>/da/dev.tsv  # Standard CommonVoice .tsv files
-target_test_tsv_file: !ref <data_folder>/fr/test.tsv  # Standard CommonVoice .tsv files
-source_test_tsv_file: !ref <data_folder>/da/test.tsv  # Standard CommonVoice .tsv files
+language: vi # use 'it' for italian, 'fr' for french, 'en' for english , It is a language for common-voice data.
+data_folder: /Users/codelink/Desktop/Projects/ICASSP/data/cv-corpus-17.0-2024-03-15
+faiss_index_path: !ref /Users/codelink/Desktop/Projects/ICASSP/git/ME-UYR-Program/recipes/CommonVoice/ASR/transformer/results/train_whisper/<seed>/faiss_index/da
+# faiss_index_path: None
+
+source_train_tsv_file: !ref <data_folder>/vi/train.tsv  # Standard CommonVoice .tsv files
+source_dev_tsv_file: !ref <data_folder>/vi/dev.tsv  # Standard CommonVoice .tsv files
+source_test_tsv_file: !ref <data_folder>/vi/test.tsv  # Standard CommonVoice .tsv files
+target_train_tsv_file: !ref <data_folder>/da/train.tsv  # Standard CommonVoice .tsv files
+target_dev_tsv_file: !ref <data_folder>/da/dev.tsv  # Standard CommonVoice .tsv files
+target_test_tsv_file: !ref <data_folder>/da/test.tsv  # Standard CommonVoice .tsv files
+
 accented_letters: True
-source_train_csv: !ref <data_folder>/da/prepared/train.csv
-target_train_csv: !ref <data_folder>/fr/prepared/train.csv
-valid_csv: !ref <data_folder>/da/prepared/dev.csv
-target_test_csv: !ref <data_folder>/fr/prepared/test.csv  # Standard CommonVoice .tsv files
-source_test_csv: !ref <data_folder>/da/prepared/test.csv  # Standard CommonVoice .tsv files
+source_train_csv: !ref <data_folder>/vi/prepared/train.csv
+source_valid_csv: !ref <data_folder>/vi/prepared/dev.csv
+source_test_csv: !ref <data_folder>/vi/prepared/test.csv  # Standard CommonVoice .tsv files
+target_train_csv: !ref <data_folder>/da/prepared/train.csv
+target_valid_csv: !ref <data_folder>/da/prepared/dev.csv
+target_test_csv: !ref <data_folder>/da/prepared/test.csv  # Standard CommonVoice .tsv files
+
 skip_prep: True # Skip data preparation
 save_index_step: 500
 
@@ -47,19 +54,19 @@ ckpt_interval_minutes: 30 # save checkpoint every N min
 ####################### Training Parameters ####################################
 freeze_whisper: False
 freeze_encoder: False
-number_of_epochs: 15
+number_of_epochs: 20
 weight_decay: 0.01
 lr_whisper: 1e-5
 warmup_steps: 500
 max_grad_norm: 2.0
-sorting: ascending
+sorting: random
 precision: fp32 # bf16, fp16 or fp32
 eval_precision: fp32
 sample_rate: 16000
 
 # With data_parallel batch_size is split into N jobs
-batch_size: 16
-test_batch_size: 4
+batch_size: 1
+test_batch_size: 1
 grad_accumulation_factor: 1
 
 

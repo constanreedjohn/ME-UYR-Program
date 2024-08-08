@@ -111,7 +111,7 @@ class ASR(sb.Brain):
         # Forward encoder + decoder
         source_enc_out, source_logits, _ = self.modules.whisper(source_wavs, source_bos_tokens)
         source_log_probs = self.hparams.log_softmax(source_logits)
-        # print(f"[COMPUTE_FORWARD] SOURCE ENCODER OUTPUT: {source_enc_out} - {type(source_enc_out)} - {source_enc_out.shape}")
+        # print(f"[COMPUTE_FORWARD] SOURCE LOGITS: {source_logits} - {type(source_logits)} - {source_logits.shape}")
         
         if stage == Stage.TRAIN:
             # Get target logits
@@ -127,6 +127,7 @@ class ASR(sb.Brain):
                 )
                 target_bos_tokens[~pad_mask] = self.tokenizer.pad_token_id
                 target_enc_out, target_logits, _ = self.modules.whisper(target_wavs, target_bos_tokens)
+                target_log_probs = self.hparams.log_softmax(target_logits)      # NLL of the inference target batch
             
             self.modules.train()
             source_embedding = source_enc_out.detach().cpu().numpy()    # (batchsize, 1500, 384)
@@ -147,12 +148,11 @@ class ASR(sb.Brain):
             
             # print(f"[COMPUTER_FORWARD] COMBINATION BETWEEN SOURCE AND TARGET WITH BATCH OF {source_enc_out.shape[0]}: {target_log_probs.shape}")
             # target_log_probs = torch.nn.functional.relu(target_logits)
-            # target_log_probs = self.hparams.log_softmax(target_logits)
             if retrieved_target.shape != source_enc_out.shape != target_enc_out.shape:
                 logger.info(f"[COMPUTE_OBJECTS] DIFF DIMENSION WHERE COMBINE: {retrieved_target.shape} - SOURCE: {source_logits.shape} - TARGET: {target_logits.shape}")
                 return [source_log_probs, None, source_wav_lens], [torch.rand([source_enc_out.shape[0], 1500, 384]), torch.rand([source_enc_out.shape[0], 1500, 384]), torch.rand([source_enc_out.shape[0], 1500, 384])]
             
-            return [source_log_probs, None, source_wav_lens], [retrieved_target, source_enc_out, target_enc_out]
+            return [source_log_probs, None, source_wav_lens], [retrieved_target, source_enc_out, target_enc_out, target_log_probs]
         
         hyps = None
         if stage == Stage.VALID:
@@ -184,11 +184,18 @@ class ASR(sb.Brain):
         )
         target_loss = 0.0
         if stage == Stage.TRAIN:
-            (retrieved_logits, source_logits, target_logits) = target_prediction
+            (retrieved_logits, source_logits, target_logits, target_log_probs) = target_prediction
             target_batch = target_batch.to(self.device)
             target_loss = triplet_loss(source_logits, retrieved_logits, target_logits)
+            target_tokens_eos, target_tokens_eos_lens = target_batch.tokens_eos
+            # target nll loss for both positive and negative batch
+            target_inference_loss = self.hparams.nll_loss(
+                target_log_probs, target_tokens_eos, length=target_tokens_eos_lens
+            )
+            
         
         if stage != Stage.TRAIN:
+            target_inference_loss = 0
             tokens, tokens_lens = source_batch.tokens
 
             # Decode token terms to words
@@ -222,7 +229,7 @@ class ASR(sb.Brain):
             # print(f"[COMPUTE OBJECTIVES] LABEL: {target_words}")
             # print(f"[COMPUTE OBJECTIVES] PREDICTED: {predicted_words}")
 
-        return source_loss, target_loss
+        return source_loss, target_loss, target_inference_loss
     
     def make_dataloader(
         self, dataset, stage, ckpt_prefix="dataloader-", **loader_kwargs
@@ -299,28 +306,29 @@ class ASR(sb.Brain):
         return dataloader
     
     def load_faiss_index(self, faiss_index_path, target_train_set, enable):
-        if faiss_index_path is not None:
-            files = sorted(os.listdir(faiss_index_path))
-            if "faiss_index_last.index" in files:
-                logger.info("[FIT] LOADING LAST INDEX")
-                faiss_index = faiss.read_index(os.path.join(faiss_index_path, "faiss_index_last.index"))
-                return faiss_index
-            else:
-                logger.info(f"[FIT] LOADING LATEST INDEX {files[-1]}")
-                faiss_index = faiss.read_index(os.path.join(faiss_index_path, files[-1]))
-                return faiss_index
+        language = faiss_index_path.split("/")[-1]
+        # if faiss_index_path is not None:
+        #     files = sorted(os.listdir(faiss_index_path))
+        #     if "faiss_index_last.index" in files:
+        #         logger.info("[FIT] LOADING LAST INDEX")
+        #         faiss_index = faiss.read_index(os.path.join(faiss_index_path, "faiss_index_last.index"))
+        #         return faiss_index
+        #     else:
+        #         logger.info(f"[FIT] LOADING LATEST INDEX {files[-1]}")
+        #         faiss_index = faiss.read_index(os.path.join(faiss_index_path, files[-1]))
+        #         return faiss_index
         
-        if os.path.exists(os.path.join(hparams['output_folder'], "faiss_index")):
-            files = sorted(os.listdir(os.path.join(hparams['output_folder'], "faiss_index")))
+        if os.path.exists(os.path.join(hparams['faiss_index_path'])):
+            files = sorted(os.listdir(os.path.join(hparams['faiss_index_path'])))
             if "faiss_index_last.index" in files:
                 logger.info("[FIT] LOADING LAST INDEX")
-                faiss_index = faiss.read_index(os.path.join(hparams['output_folder'], "faiss_index", "faiss_index_last.index"))
+                faiss_index = faiss.read_index(os.path.join(hparams['faiss_index_path'], "faiss_index_last.index"))
                 return faiss_index
             else:
                 logger.info(f"[FIT] LOADING LATEST INDEX {files[-1]}")
-                faiss_index = faiss.read_index(os.path.join(hparams['output_folder'], "faiss_index", files[-1]))
+                faiss_index = faiss.read_index(os.path.join(hparams['faiss_index_path'], files[-1]))
                 return faiss_index
-        else:
+        elif not os.path.exists(os.path.join(hparams['faiss_index_path'])):
             logger.info(f"[FIT] NO SAVED INDEX FOUND - CREATING")
             faiss_index = self.build_faiss_index(target_train_set=target_train_set, enable=enable)
             return faiss_index
@@ -330,7 +338,8 @@ class ASR(sb.Brain):
         epoch_counter,
         source_train_set,
         target_train_set,
-        valid_set=None,
+        source_valid_set=None,
+        target_valid_set=None,
         progressbar=None,
         train_loader_kwargs={},
         valid_loader_kwargs={}
@@ -358,7 +367,7 @@ class ASR(sb.Brain):
             A set of data to use for training. If a Dataset is given, a
             DataLoader is automatically created. If a DataLoader is given, it is
             used directly.
-        valid_set : Dataset, DataLoader
+        source_valid_set : Dataset, DataLoader
             A set of data to use for validation. If a Dataset is given, a
             DataLoader is automatically created. If a DataLoader is given, it is
             used directly.
@@ -371,7 +380,7 @@ class ASR(sb.Brain):
             DataLoader kwargs are all valid.
         valid_loader_kwargs : dict
             Kwargs passed to `make_dataloader()` for making the valid_loader
-            (if valid_set is a Dataset, not DataLoader).
+            (if source_valid_set is a Dataset, not DataLoader).
             E.g., batch_size, num_workers.
             DataLoader kwargs are all valid.
 
@@ -401,12 +410,23 @@ class ASR(sb.Brain):
                 target_train_set, stage=Stage.TRAIN, **train_loader_kwargs
             )
             
-        if valid_set is not None and not (
-            isinstance(valid_set, DataLoader)
-            or isinstance(valid_set, LoopedLoader)
+        if source_valid_set is not None and not (
+            isinstance(source_valid_set, DataLoader)
+            or isinstance(source_valid_set, LoopedLoader)
         ):
-            valid_set = self.make_dataloader(
-                valid_set,
+            source_valid_set = self.make_dataloader(
+                source_valid_set,
+                stage=Stage.VALID,
+                ckpt_prefix=None,
+                **valid_loader_kwargs,
+            )
+            
+        if target_valid_set is not None and not (
+            isinstance(target_valid_set, DataLoader)
+            or isinstance(target_valid_set, LoopedLoader)
+        ):
+            target_valid_set = self.make_dataloader(
+                target_valid_set,
                 stage=Stage.VALID,
                 ckpt_prefix=None,
                 **valid_loader_kwargs,
@@ -431,7 +451,35 @@ class ASR(sb.Brain):
                 faiss_index=faiss_index,
                 enable=enable
             )
-            self._fit_valid(valid_set=valid_set, epoch=epoch, enable=enable)
+            self._fit_valid(valid_set=source_valid_set, epoch=epoch, enable=enable)
+            
+            self.modules.eval()
+            avg_valid_loss = 0.0
+            with torch.no_grad():
+                for batch in tqdm(
+                    target_valid_set,
+                    dynamic_ncols=True,
+                    disable=not enable,
+                    colour=self.tqdm_barcolor["valid"],
+                ):
+                    self.step += 1
+                    loss = self.evaluate_batch(batch, stage=Stage.VALID)
+                    avg_valid_loss = self.update_average(loss, avg_valid_loss)
+
+                    # Debug mode only runs a few batches
+                    if self.debug and self.step == self.debug_batches:
+                        break
+
+                self.step = 0
+                
+                # Compute/store important stats
+                stage_stats = {"loss": avg_valid_loss}
+                stage_stats["CER"] = self.cer_metric.summarize("error_rate")
+                stage_stats["WER"] = self.wer_metric.summarize("error_rate")
+                with open(hparams['train_log'], 'a') as fout:
+                    fout.write(f"Target_valid_loss: {stage_stats['loss']} - target_valid_CER: {stage_stats['CER']} - target_valid_WER: {stage_stats['WER']}\n")
+                logger.info(f"Target_valid_loss: {stage_stats['loss']} - target_valid_CER: {stage_stats['CER']} - target_valid_WER: {stage_stats['WER']}")
+            
 
             # Debug mode only runs a few epochs
             if (
@@ -444,7 +492,7 @@ class ASR(sb.Brain):
     def build_faiss_index(self, target_train_set, enable):
         print("[BUILD FAISS INDEX] INGESTING TARGET ENCODER INTO INDEX...")
         faiss_index = faiss.IndexFlatL2(576000)
-        os.makedirs(os.path.join(hparams['output_folder'], "faiss_index"), exist_ok=True)
+        os.makedirs(os.path.join(hparams['faiss_index_path']), exist_ok=True)
         with tqdm(
             target_train_set,
             total=len(target_train_set),
@@ -458,7 +506,7 @@ class ASR(sb.Brain):
                 for idx, target_batch in enumerate(t):
                     if idx % hparams['save_index_step'] == 0:
                         logger.info(f"[BUILD FAISS INDEX] SAVING INDEX AT BATCH SIZE INDEX {idx}")
-                        faiss.write_index(faiss_index, os.path.join(hparams['output_folder'], f"faiss_index/faiss_index_{idx}.index"))
+                        faiss.write_index(faiss_index, os.path.join(hparams['faiss_index_path'], f"faiss_index_{idx}.index"))
                         
                     target_batch = target_batch.to(self.device)
                     target_wavs, target_wav_lens = target_batch.sig
@@ -480,7 +528,7 @@ class ASR(sb.Brain):
                     faiss_index.add(target_embedding)
                 
                 logger.info(f"[BUILD FAISS INDEX] SAVING INDEX AT LAST")
-                faiss.write_index(faiss_index, os.path.join(hparams['output_folder'], f"faiss_index/faiss_index_last.index"))
+                faiss.write_index(faiss_index, os.path.join(hparams['faiss_index_path'], f"faiss_index_last.index"))
         print(f"[BUILD FAISS INDEX] FAISS TOTAL: {faiss_index.ntotal}")
             
         return faiss_index
@@ -582,7 +630,7 @@ class ASR(sb.Brain):
                     dtype=amp.dtype, device_type=torch.device(self.device).type
                 ):
                     source_outputs, target_outputs = self.compute_forward(source_batch=source_batch, target_batch=target_batch, faiss_index=faiss_index, faiss_k=1, stage=Stage.TRAIN)
-                    source_loss, target_loss = self.compute_objectives(
+                    source_loss, target_loss, target_inference_loss = self.compute_objectives(
                         source_predictions=source_outputs, 
                         source_batch=source_batch, 
                         target_prediction=target_outputs,
@@ -591,7 +639,7 @@ class ASR(sb.Brain):
                     )
             else:
                 source_outputs, target_outputs = self.compute_forward(source_batch=source_batch, target_batch=target_batch, faiss_index=faiss_index, faiss_k=1, stage=Stage.TRAIN)
-                source_loss, target_loss = self.compute_objectives(
+                source_loss, target_loss, target_inference_loss = self.compute_objectives(
                     source_predictions=source_outputs, 
                     source_batch=source_batch, 
                     target_prediction=target_outputs,
@@ -608,7 +656,13 @@ class ASR(sb.Brain):
                 target_loss.mean() / self.grad_accumulation_factor
             )
             self.check_loss_isfinite(scaled_target_loss)
-            logger.info(f"[FIT_BATCH] SOURCE_LOSS: {scaled_source_loss} - TARGET_LOSS: {scaled_target_loss}\n")
+            
+            scaled_target_inference_loss = self.scaler.scale(
+                target_inference_loss.mean() / self.grad_accumulation_factor
+            )
+            self.check_loss_isfinite(scaled_target_inference_loss)
+            
+            logger.info(f"[FIT_BATCH] SOURCE_LOSS: {scaled_source_loss} - TARGET_LOSS: {scaled_target_loss} - TARGET_INFER_LOSS: {scaled_target_inference_loss}\n")
             loss = scaled_source_loss + scaled_target_loss
             loss.backward()
 
@@ -739,7 +793,7 @@ class ASR(sb.Brain):
                 dtype=amp.dtype, device_type=torch.device(self.device).type
             ):
                 source_outputs, target_outputs = self.compute_forward(source_batch=source_batch, target_batch=None, faiss_index=None, faiss_k=1, stage=stage)
-                source_loss, target_loss = self.compute_objectives(
+                source_loss, target_loss, target_inference_loss = self.compute_objectives(
                     source_predictions=source_outputs, 
                     source_batch=source_batch, 
                     target_prediction=target_outputs,
@@ -748,7 +802,7 @@ class ASR(sb.Brain):
                 )
         else:
             source_outputs, target_outputs = self.compute_forward(source_batch=source_batch, target_batch=None, faiss_index=None, faiss_k=1, stage=stage)
-            source_loss, target_loss = self.compute_objectives(
+            source_loss, target_loss, target_inference_loss = self.compute_objectives(
                 source_predictions=source_outputs, 
                 source_batch=source_batch, 
                 target_prediction=target_outputs,
@@ -853,6 +907,7 @@ def dataio_prepare(hparams, tokenizer):
             sort_key="duration",
             key_max_value={"duration": hparams["avoid_if_longer_than"]},
         )
+        source_train_data = source_train_data.batch_shuffle(hparams["train_loader_kwargs"]["batch_size"])
         target_train_data = target_train_data.batch_shuffle(hparams["train_loader_kwargs"]["batch_size"])
 
     else:
@@ -860,11 +915,17 @@ def dataio_prepare(hparams, tokenizer):
             "sorting must be random, ascending or descending"
         )
 
-    valid_data = sb.dataio.dataset.DynamicItemDataset.from_csv(
-        csv_path=hparams["valid_csv"],
+    source_valid_data = sb.dataio.dataset.DynamicItemDataset.from_csv(
+        csv_path=hparams["source_valid_csv"],
         # replacements={"data_root": data_folder},
     )
-    valid_data = valid_data.filtered_sorted(sort_key="duration")
+    source_valid_data = source_valid_data.filtered_sorted(sort_key="duration")
+    
+    target_valid_data = sb.dataio.dataset.DynamicItemDataset.from_csv(
+        csv_path=hparams["target_valid_csv"],
+        # replacements={"data_root": data_folder},
+    )
+    target_valid_data = target_valid_data.filtered_sorted(sort_key="duration")
 
     # test is separate
     target_test_data = sb.dataio.dataset.DynamicItemDataset.from_csv(
@@ -877,7 +938,7 @@ def dataio_prepare(hparams, tokenizer):
         # replacements={"data_root": data_folder},
     )
 
-    datasets = [source_train_data, target_train_data, valid_data, target_test_data, source_test_data]
+    datasets = [source_train_data, target_train_data, source_valid_data, target_valid_data, target_test_data, source_test_data]
 
     # 2. Define audio pipeline:
     @sb.utils.data_pipeline.takes("wav")
@@ -920,7 +981,7 @@ def dataio_prepare(hparams, tokenizer):
         ["id", "sig", "tokens_list", "tokens_bos", "tokens_eos", "tokens"],
     )
 
-    return source_train_data, target_train_data, valid_data, target_test_data, source_test_data
+    return source_train_data, target_train_data, source_valid_data, target_valid_data, target_test_data, source_test_data
 
 
 if __name__ == "__main__":
@@ -964,7 +1025,7 @@ if __name__ == "__main__":
     tokenizer = hparams["whisper"].tokenizer
 
     # here we create the datasets objects as well as tokenization and encoding
-    source_train_data, target_train_data, valid_data, target_test_data, source_test_data = dataio_prepare(hparams, tokenizer)
+    source_train_data, target_train_data, source_valid_data, target_valid_data, target_test_data, source_test_data = dataio_prepare(hparams, tokenizer)
 
     # Trainer initialization
     asr_brain = ASR(
@@ -991,7 +1052,8 @@ if __name__ == "__main__":
             asr_brain.hparams.epoch_counter,
             source_train_data,
             target_train_data,
-            valid_data,
+            source_valid_data,
+            target_valid_data,
             train_loader_kwargs=hparams["train_loader_kwargs"],
             valid_loader_kwargs=hparams["valid_loader_kwargs"],
         )
@@ -1015,10 +1077,19 @@ if __name__ == "__main__":
         test_loader_kwargs=hparams["test_loader_kwargs"],
     )
 
-    logger.info(f"[MAIN] VALIDATING")
-    asr_brain.hparams.valid_wer_file = hparams["valid_wer_file"]
+    logger.info(f"[MAIN] SOURCE VALIDATING")
+    asr_brain.hparams.source_valid_wer_file = hparams["source_valid_wer_file"]
     asr_brain.evaluate(
-        valid_data,
+        source_valid_data,
+        stage=Stage.VALID,
+        min_key="WER",
+        test_loader_kwargs=hparams["valid_loader_kwargs"],
+    )
+    
+    logger.info(f"[MAIN] TARGET VALIDATING")
+    asr_brain.hparams.target_valid_wer_file = hparams["target_valid_wer_file"]
+    asr_brain.evaluate(
+        target_valid_data,
         stage=Stage.VALID,
         min_key="WER",
         test_loader_kwargs=hparams["valid_loader_kwargs"],
