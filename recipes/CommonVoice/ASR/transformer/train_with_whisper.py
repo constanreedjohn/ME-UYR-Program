@@ -188,7 +188,7 @@ class ASR(sb.Brain):
             target_batch = target_batch.to(self.device)
             target_loss = triplet_loss(source_logits, retrieved_logits, target_logits)
             target_tokens_eos, target_tokens_eos_lens = target_batch.tokens_eos
-            # target nll loss for both positive and negative batch
+            # target nll loss for both batch
             target_inference_loss = self.hparams.nll_loss(
                 target_log_probs, target_tokens_eos, length=target_tokens_eos_lens
             )
@@ -663,7 +663,7 @@ class ASR(sb.Brain):
             self.check_loss_isfinite(scaled_target_inference_loss)
             
             logger.info(f"[FIT_BATCH] SOURCE_LOSS: {scaled_source_loss} - TARGET_LOSS: {scaled_target_loss} - TARGET_INFER_LOSS: {scaled_target_inference_loss}\n")
-            loss = scaled_source_loss + scaled_target_loss
+            loss = scaled_source_loss + scaled_target_loss + scaled_target_inference_loss
             loss.backward()
 
         if should_step:
@@ -907,7 +907,7 @@ def dataio_prepare(hparams, tokenizer):
             sort_key="duration",
             key_max_value={"duration": hparams["avoid_if_longer_than"]},
         )
-        source_train_data = source_train_data.batch_shuffle(hparams["train_loader_kwargs"]["batch_size"])
+        # source_train_data = source_train_data.batch_shuffle(hparams["train_loader_kwargs"]["batch_size"])
         target_train_data = target_train_data.batch_shuffle(hparams["train_loader_kwargs"]["batch_size"])
 
     else:
